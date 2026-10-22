@@ -1,0 +1,219 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Infrastructure half of the nested Hyper-V build. Deploy.ps1 performs regional preflight, provisions this template, installs Hyper-V, restarts Windows, and configures/verifies the host through Azure Run Command.",
+    "networking": "Creates only a private NIC in the caller's existing subnet. No VNet, subnet, VPN, route, NSG, public IP, or egress service is created or modified. Existing VPN/security controls must permit management, and existing egress must support Azure VM Agent/Run Command.",
+    "nestedNetworking": "Configure-HyperV.ps1 creates an internal NestedNAT switch and WinNAT prefix 192.168.100.0/24 inside Windows, not an Azure subnet. Guests use gateway 192.168.100.1 and need static IP/DNS; this prefix must not overlap reachable VNet/VPN networks.",
+    "storage": "Two managed disks: 127-GiB OS disk and one configurable data disk at LUN 0. The host script formats only a RAW non-OS SCSI/SAS disk as F: NTFS with 64-KiB allocation units; initialized disks must already match the expected mount/label.",
+    "security": "The current resource requests TrustedLaunch. The preflight family's original design and existing security contract test target Standard security. Preserve deliberate security settings, but reconcile that contract and verify nested boot support before assuming this configuration is suitable.",
+    "lifecycle": "Deploying this JSON alone does not configure Hyper-V. Incremental deployment does not remove obsolete public IP/VNet/NSG resources from older builds. Back up guest VHDX files before deleting the VM resource group.",
+    "variables": "nicName derives the private NIC name from virtualMachineName. Existing network names are required parameters with no hardcoded defaults.",
+    "outputs": "vmResourceID identifies the host for Azure operations; privateIPAddress is read from the NIC after provisioning for management over the existing VPN. No Internet-facing endpoint is returned."
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "centralus",
+      "metadata": {
+        "description": "Region for both VM and NIC; must match the existing VNet. Resource-group metadata location alone does not determine where these resources are deployed."
+      }
+    },
+    "virtualMachineName": {
+      "type": "string",
+      "defaultValue": "Hyperv01",
+      "minLength": 1,
+      "maxLength": 15,
+      "metadata": {
+        "description": "Azure VM resource name and Windows computer name. Windows limits the computer name to 15 characters. Also used as the prefix for NIC and managed disk names."
+      }
+    },
+    "virtualMachineSize": {
+      "type": "string",
+      "defaultValue": "Standard_D8s_v5",
+      "metadata": {
+        "description": "Host compute SKU. Deploy.ps1 checks regional/subscription restrictions, known nested-capable family, Gen2, accelerated networking, disk compatibility, and vCPU quota. Catalog availability is not an allocation guarantee."
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "vadmin",
+      "metadata": {
+        "description": "Local Windows administrator on the Azure host. Azure username restrictions apply; this is not a nested guest account."
+      }
+    },
+    "imageSku": {
+      "type": "string",
+      "defaultValue": "2025-datacenter-g2",
+      "metadata": { "description": "Gen2 Windows Server SKU in the MicrosoftWindowsServer:WindowsServer offer. Defaults to Server 2025 Datacenter Desktop Experience; selecting Core or an older OS is an explicit operator choice." }
+    },
+    "imageVersion": {
+      "type": "string",
+      "defaultValue": "latest",
+      "metadata": { "description": "Marketplace version. Deploy.ps1 resolves latest to a concrete version and queries its Gen2/Windows compatibility metadata before passing that exact version here." }
+    },
+    "osDiskSku": {
+      "type": "string",
+      "defaultValue": "StandardSSD_LRS",
+      "allowedValues": [ "Standard_LRS", "StandardSSD_LRS", "StandardSSD_ZRS", "Premium_LRS", "Premium_ZRS" ],
+      "metadata": {
+        "description": "OS managed disk tier for the fixed 127-GiB disk. Standard SSD LRS is the default; Premium requires a compatible VM. Ultra Disk and Premium SSD v2 are not supported OS disks."
+      }
+    },
+    "dataDiskSku": {
+      "type": "string",
+      "defaultValue": "Standard_LRS",
+      "allowedValues": [ "Standard_LRS", "StandardSSD_LRS", "StandardSSD_ZRS", "Premium_LRS", "Premium_ZRS" ],
+      "metadata": {
+        "description": "Guest-file managed disk tier. Standard_LRS is Standard HDD LRS, the cheapest default, not a performance recommendation. Alternatives change price/performance/redundancy; no host caching is used."
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "minLength": 8,
+      "metadata": {
+        "description": "Host administrator password. Passed as an ARM securestring; supply through a PowerShell SecureString rather than source-controlled parameter files. Azure password complexity and current template minimum length still apply."
+      }
+    },
+    "vnetResourceGroupName": {
+      "type": "string",
+      "minLength": 1,
+      "metadata": {
+        "description": "Resource group containing the existing VNet in the deployment subscription. May differ from the VM resource group; the caller needs VNet read and subnet-join permissions."
+      }
+    },
+    "vnetName": {
+      "type": "string",
+      "minLength": 1,
+      "metadata": {
+        "description": "Existing VNet in the VM region. Its address space, DNS servers, peering, VPN configuration, and routes are not modified."
+      }
+    },
+    "subnetName": {
+      "type": "string",
+      "minLength": 1,
+      "metadata": {
+        "description": "Existing VM-capable subnet, not a reserved gateway/Bastion or incompatible delegated subnet. Its NSG/routes/egress remain the operator's responsibility; no subnet is created or changed."
+      }
+    },
+    "dataDiskSizeGB": {
+      "type": "int",
+      "defaultValue": 256,
+      "minValue": 32,
+      "maxValue": 32767,
+      "metadata": {
+        "description": "Provisioned data disk capacity in GiB, exposed as F: by the host script. Managed disks are billed by provisioned tier; dynamically expanding guest VHDX files still require free physical capacity."
+      }
+    },
+    "timeZone": {
+      "type": "string",
+      "defaultValue": "Eastern Standard Time",
+      "metadata": {
+        "description": "Windows time-zone identifier applied inside the host OS. Independent of Azure region and the deployment workstation's timestamp offset."
+      }
+    }
+  },
+  "variables": {
+    "nicName": "[concat(parameters('virtualMachineName'), '-nic')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "comments": "Private-only attachment to the existing subnet, whose resource group is supplied separately. Dynamic private addressing is assigned by Azure DHCP. Accelerated networking requires SKU support. IP forwarding is unnecessary because Windows WinNAT translates guest traffic to the host address. No public IP or NIC NSG is attached here.",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "enableAcceleratedNetworking": true,
+        "enableIPForwarding": false,
+        "ipConfigurations": [
+          {
+            "name": "primary",
+            "properties": {
+              "primary": true,
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[resourceId(parameters('vnetResourceGroupName'), 'Microsoft.Network/virtualNetworks/subnets', parameters('vnetName'), parameters('subnetName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "comments": "Waits for the NIC before creating a Gen2 Windows host. VM Agent is required for post-deployment Run Command; boot diagnostics use managed Azure storage. SCSI keeps data LUN identification aligned with Configure-HyperV.ps1. OS caching is ReadWrite; data caching is None for nested VHDX workloads. Hyper-V role installation/reboot/NAT setup are orchestrated outside this template, not by an extension in this resource.",
+      "apiVersion": "2024-11-01",
+      "name": "[parameters('virtualMachineName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('virtualMachineSize')]"
+        },
+        "securityProfile": {
+          "securityType": "TrustedLaunch"
+        },
+        "osProfile": {
+          "computerName": "[parameters('virtualMachineName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]",
+          "windowsConfiguration": {
+            "provisionVMAgent": true,
+            "enableAutomaticUpdates": true,
+            "timeZone": "[parameters('timeZone')]"
+          }
+        },
+        "storageProfile": {
+          "diskControllerType": "SCSI",
+          "imageReference": {
+            "publisher": "MicrosoftWindowsServer",
+            "offer": "WindowsServer",
+            "sku": "[parameters('imageSku')]",
+            "version": "[parameters('imageVersion')]"
+          },
+          "osDisk": {
+            "name": "[concat(parameters('virtualMachineName'), '-os')]",
+            "createOption": "FromImage",
+            "diskSizeGB": 127,
+            "caching": "ReadWrite",
+            "managedDisk": { "storageAccountType": "[parameters('osDiskSku')]" }
+          },
+          "dataDisks": [
+            {
+              "name": "[concat(parameters('virtualMachineName'), '-data')]",
+              "lun": 0,
+              "createOption": "Empty",
+              "diskSizeGB": "[parameters('dataDiskSizeGB')]",
+              "caching": "None",
+              "managedDisk": { "storageAccountType": "[parameters('dataDiskSku')]" }
+            }
+          ]
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]",
+              "properties": { "primary": true }
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": { "enabled": true }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "vmResourceID": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/virtualMachines', parameters('virtualMachineName'))]"
+    },
+    "privateIPAddress": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))).ipConfigurations[0].properties.privateIPAddress]"
+    }
+  }
+}
