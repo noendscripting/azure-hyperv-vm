@@ -247,10 +247,12 @@ Nested VM: 192.168.100.10/24
   The build does not add egress resources or alter subnet outbound settings.
 * The nested `192.168.100.0/24` prefix must not overlap your VNet, peered networks,
   or VPN/on-premises routes. Verify this before deployment.
-* **WinNAT does not provide DHCP or DNS.** Give each guest a unique static
+* **WinNAT does not provide DHCP or DNS.** By default, give each guest a unique static
   `192.168.100.2` through `192.168.100.254` address, prefix length `24`, gateway
   `192.168.100.1`, and DNS `1.1.1.1` / `8.8.8.8` (or reachable organizational DNS).
   Do not reuse the gateway, network address `.0`, or broadcast address `.255`.
+  For automatic addressing during Windows OOBE, optionally
+  [configure DHCP on the host](#optional-host-dhcp-for-guest-oobe).
 * Guest-to-guest traffic stays on the internal switch. Azure NSGs do not filter
   this traffic; use guest firewalls if isolation is needed.
 * The build intentionally does **not** publish guest ports to the Internet.
@@ -260,6 +262,271 @@ Nested VM: 192.168.100.10/24
 * The host supports a single WinNAT internal prefix. Conflicting existing NAT
   configurations (for example HNS/containers) cause an explicit failure; the
   scripts do not silently remove them.
+
+## Optional host DHCP for guest OOBE
+
+The deployment configures WinNAT but **does not install DHCP Server**. Add the
+Windows Server DHCP role manually if guests need automatic networking during
+Windows out-of-box experience (OOBE), including Microsoft Entra join. DHCP supplies
+an address, gateway, and DNS server addresses; WinNAT supplies translation. DHCP
+does not create Internet egress or provide a DNS resolver.
+
+Run the following on the **Hyper-V host in elevated Windows PowerShell 5.1**,
+not on your deployment workstation or inside a guest. These are operator-run
+configuration steps, not changes made automatically by `Deploy.ps1`.
+
+### 1. Check prerequisites and existing configuration
+
+* Confirm that the host itself has working outbound DNS/HTTPS and that
+  `192.168.100.0/24` does not overlap VNet, peering, VPN, or on-premises networks.
+* Inventory guest addresses, including powered-off guests. This example reserves
+  `.100` through `.200` for DHCP; move conflicting static guests or choose a
+  different unused pool before activating it. Keep static addresses outside
+  that pool, or create explicit DHCP exclusions/reservations.
+* Bind the DHCP service **only to `vEthernet (NestedNAT)`**. Never serve DHCP on
+  the Azure-facing NIC. Disabling a DHCP **server binding** does not disable the
+  Azure NIC's DHCP **client** or change its IP configuration.
+* If DHCP Server is already installed, inspect its bindings, scopes, options,
+  and leases in `dhcpmgmt.msc` before proceeding. The DHCP example below is for a
+  fresh, dedicated installation; do not overwrite or disable another workload's
+  DHCP configuration.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+Get-WindowsFeature Hyper-V, DHCP
+Get-VMSwitch
+Get-NetIPAddress -AddressFamily IPv4
+Get-NetNat
+Test-NetConnection www.microsoft.com -Port 443
+```
+
+### 2. Verify or create the internal switch and WinNAT
+
+After a successful deployment these settings already exist. The following
+network-only commands reuse correct settings and reject conflicts; unlike
+rerunning the full host configuration script, they do not touch storage or
+create a boot-test VM.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$switchName = 'NestedNAT'
+$gateway = '192.168.100.1'
+$prefix = '192.168.100.0/24'
+
+$switch = Get-VMSwitch | Where-Object Name -eq $switchName
+if ($switch -and $switch.SwitchType -ne 'Internal') {
+    throw 'NestedNAT exists but is not an internal switch. Review it manually.'
+}
+if (-not $switch) {
+    New-VMSwitch -Name $switchName -SwitchType Internal | Out-Null
+}
+$adapter = Get-NetAdapter -Name "vEthernet ($switchName)"
+$addresses = @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4)
+$conflicts = @($addresses | Where-Object {
+    $_.IPAddress -notlike '169.254.*' -and
+    ($_.IPAddress -ne $gateway -or $_.PrefixLength -ne 24)
+})
+if ($conflicts.Count -gt 0) {
+    throw 'The internal adapter has conflicting addresses. Review it manually.'
+}
+if (-not ($addresses | Where-Object { $_.IPAddress -eq $gateway -and $_.PrefixLength -eq 24 })) {
+    New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $gateway -PrefixLength 24 | Out-Null
+}
+if (Get-NetRoute -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 |
+        Where-Object DestinationPrefix -eq '0.0.0.0/0') {
+    throw 'The internal adapter must not have a default gateway. Review its routes.'
+}
+
+$nats = @(Get-NetNat)
+if ($nats | Where-Object Name -ne $switchName) {
+    throw 'Another WinNAT configuration exists. Resolve the conflict without deleting it blindly.'
+}
+$nat = $nats | Where-Object Name -eq $switchName
+if ($nat -and $nat.InternalIPInterfaceAddressPrefix -ne $prefix) {
+    throw 'NestedNAT has a different internal prefix. Review it manually.'
+}
+if (-not $nat) {
+    New-NetNat -Name $switchName -InternalIPInterfaceAddressPrefix $prefix | Out-Null
+}
+if (-not (Get-NetNat -Name $switchName).Active) {
+    throw 'NestedNAT is not active.'
+}
+```
+
+Do not add a default gateway to the internal adapter or change the Azure NIC's
+DHCP, DNS, switch attachment, or default route.
+
+### 3. Install DHCP Server and restrict its bindings
+
+For a **new DHCP installation only**, run:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+if ((Get-WindowsFeature DHCP).Installed) {
+    throw 'DHCP is already installed. Inspect existing configuration before making changes.'
+}
+$installation = Install-WindowsFeature DHCP -IncludeManagementTools
+if (-not $installation.Success) {
+    throw 'DHCP Server installation did not succeed.'
+}
+Add-DhcpServerSecurityGroup
+Restart-Service DHCPServer
+Set-Service DHCPServer -StartupType Automatic
+
+$internalAlias = 'vEthernet (NestedNAT)'
+$bindings = @(Get-DhcpServerv4Binding)
+if (-not ($bindings | Where-Object InterfaceAlias -eq $internalAlias)) {
+    throw 'DHCP cannot bind to NestedNAT. Check the internal adapter and its static IPv4 address.'
+}
+foreach ($binding in $bindings) {
+    Set-DhcpServerv4Binding -InterfaceAlias $binding.InterfaceAlias `
+        -BindingState ($binding.InterfaceAlias -eq $internalAlias)
+}
+# This guide serves IPv4 only.
+foreach ($binding in @(Get-DhcpServerv6Binding)) {
+    Set-DhcpServerv6Binding -InterfaceAlias $binding.InterfaceAlias -BindingState $false
+}
+Get-DhcpServerv4Binding
+Get-DhcpServerv6Binding
+```
+
+Verify that only the internal IPv4 binding is enabled before creating an active
+scope. The DHCP role installs Windows Firewall rules; ensure applicable DHCP
+server rules permit client UDP 68 to server UDP 67 on the internal interface.
+Keep Windows Firewall enabled. Do not open DHCP ports in Azure NSGs: guest DHCP
+broadcasts remain on the internal switch. Recheck bindings after adding host NICs.
+
+**AD-domain-joined host:** have an authorized AD administrator authorize the DHCP
+server using the host's actual AD DNS name and appropriate static server address,
+then verify it with `Get-DhcpServerInDC`. Follow your domain's DHCP policy; do not
+bypass authorization. See the linked Microsoft installation guide for
+`Add-DhcpServerInDC` examples. **Workgroup host:** skip AD authorization.
+Microsoft Entra join of a guest does not require the host to join AD DS or
+the installation of an AD domain controller.
+
+### 4. Create the scope, gateway, and DNS options
+
+The scope starts inactive so it cannot lease addresses before its options are
+configured. These creation commands are not a rerunnable configuration script:
+if the scope already exists, inspect it instead of deleting/recreating it.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+Add-DhcpServerv4Scope -Name 'NestedNAT guests' `
+    -StartRange 192.168.100.100 -EndRange 192.168.100.200 `
+    -SubnetMask 255.255.255.0 -State InActive
+Set-DhcpServerv4OptionValue -ScopeId 192.168.100.0 `
+    -Router 192.168.100.1 -DnsServer 1.1.1.1, 8.8.8.8
+Set-DhcpServerv4Scope -ScopeId 192.168.100.0 -State Active
+
+Get-Service DHCPServer
+Get-DhcpServerv4Scope -ScopeId 192.168.100.0
+Get-DhcpServerv4OptionValue -ScopeId 192.168.100.0
+```
+
+Replace the example public DNS servers with reachable organizational resolvers if
+required by your egress policy. Do not use `192.168.100.1` as DNS unless you
+separately install/configure a DNS service there; WinNAT is not a DNS proxy.
+
+### 5. Verify a guest during OOBE
+
+Create a guest connected to `NestedNAT` using the helper below and leave its
+network adapter set to obtain IP and DNS automatically. A fresh Windows guest
+should receive a lease during OOBE without a local administrator sign-in.
+
+On the host, verify the connection and lease:
+
+```powershell
+Get-VMNetworkAdapter -VMName lab01 |
+    Select-Object VMName, SwitchName, MacAddress, Status
+Get-DhcpServerv4Lease -ScopeId 192.168.100.0
+```
+
+Where available, press **Shift+F10** in guest OOBE and run:
+
+```text
+ipconfig /renew
+ipconfig /all
+nslookup login.microsoftonline.com
+```
+
+Expect an address in `.100` through `.200`, mask `255.255.255.0`, gateway
+`192.168.100.1`, and the configured DNS servers. From PowerShell in that guest,
+`Test-NetConnection login.microsoftonline.com -Port 443` checks one sign-in
+endpoint, not all Entra/Intune requirements. Return to OOBE and retry networking.
+Use a supported Windows client edition (for example Pro or Enterprise, not Home)
+and ensure tenant join/enrollment policy and required Microsoft endpoints allow
+the intended flow. DHCP alone does not configure Entra join or Windows Autopilot.
+
+For no lease or a `169.254.x.x` address, check switch attachment, guest DHCP-client
+settings, server bindings, scope state/free addresses, authorization (if applicable),
+Windows Firewall, and DHCP Server event logs. If a lease is present but Internet
+access fails, check guest DNS/default route, host NAT, and upstream egress.
+
+Existing guests configured with the static helper remain static: enabling the
+server does not migrate them. To migrate one, record its old settings, then use
+its console to select automatic IPv4 **and** DNS assignment and renew the lease.
+Do not run the static helper on guests intended to use DHCP.
+
+## Optional: prefer IPv4 on the host and Windows guests
+
+To stop IPv6 being the preferred protocol, configure Windows to **prefer IPv4
+over IPv6**, rather than disabling IPv6 or unchecking its adapter binding.
+Microsoft recommends keeping IPv6 enabled because Windows components depend on
+it. This machine-wide preference does not supply a DHCP lease or fix mismatched
+WinNAT, gateway, or DHCP-scope settings.
+
+Run the following in **elevated PowerShell separately on the host and inside
+each Windows guest**. Changing the host does not change its guests. During guest
+OOBE, where available, press **Shift+F10**, launch `powershell.exe`, and run the
+same commands.
+
+Record the existing `DisabledComponents` value before changing it. If Group
+Policy or device management controls this setting, change the managing policy
+instead. The guard below rejects existing IPv6-disable flags rather than
+silently replacing another administrator's configuration.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'
+$settings = Get-ItemProperty -LiteralPath $path
+$existing = $settings.PSObject.Properties['DisabledComponents']
+if ($null -ne $existing) {
+    Write-Output "Previous DisabledComponents: $($existing.Value)"
+    if ($existing.Value -notin @(0, 32)) {
+        throw 'Existing IPv6 flags require review before changing protocol preference.'
+    }
+} else {
+    Write-Output 'Previous DisabledComponents: absent (Windows default).'
+}
+New-ItemProperty -LiteralPath $path -Name DisabledComponents `
+    -PropertyType DWord -Value 0x20 -Force | Out-Null
+Get-ItemProperty -LiteralPath $path -Name DisabledComponents
+```
+
+`0x20` is decimal `32`: prefer IPv4 while keeping IPv6 enabled. **Restart each
+changed machine for the setting to take effect.** Save guest work and shut down
+nested VMs cleanly before restarting the host; a host restart interrupts every
+guest. Run this only when ready, separately on each changed machine:
+
+```powershell
+Restart-Computer -Confirm
+```
+
+After restart, verify the registry value and effective address-selection policy
+on both the host and each guest:
+
+```powershell
+Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' `
+    -Name DisabledComponents
+netsh interface ipv6 show prefixpolicies
+```
+
+Expect `DisabledComponents` to be `32` and the IPv4-mapped prefix
+`::ffff:0:0/96` to have a higher precedence than `::/0`. Applications can still
+explicitly use IPv6; this setting changes preference, not availability.
+To undo the change, restore the recorded DWORD value, or remove only the
+`DisabledComponents` value if it was originally absent, then restart again.
 
 ## Create and network a guest
 
@@ -301,7 +568,9 @@ or restoring to another Hyper-V host; copying a VHDX alone does not preserve
 vTPM state or guarantee that the VM can boot. Do not casually replace an existing
 encrypted VM's protector or clear its TPM.
 
-After a **Windows** guest is installed, configure and test its network from the
+If you configured [host DHCP](#optional-host-dhcp-for-guest-oobe), leave the guest
+on automatic IP/DNS assignment and skip the static helper below. For static-only
+networking, after a **Windows** guest is installed, configure and test its network from the
 host without needing an existing guest network connection:
 
 ```powershell
@@ -312,7 +581,8 @@ $guestCredential = Get-Credential -Message 'Administrator account inside lab01'
 
 This uses PowerShell Direct, sets the static IP/gateway/DNS, and checks outbound
 DNS and TCP 443 to `www.microsoft.com`. Use a different address for each guest;
-the helper cannot detect addresses used by powered-off VMs. For Linux or older
+keep it outside any DHCP pool. The helper cannot detect addresses used by
+powered-off VMs. For Linux or older
 Windows guests without PowerShell Direct support, configure the same settings
 inside the guest using its native network tools. Disconnect the ISO or adjust
 the firmware boot order after installation.
@@ -400,6 +670,9 @@ require a user-authorized Azure deployment.
 * [Nested virtualization overview](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/user-guide/nested-virtualization)
 * [Azure nested virtualization and NAT](https://learn.microsoft.com/en-us/azure/lab-services/how-to-enable-nested-virtualization-template-vm)
 * [Hyper-V NAT networking](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/user-guide/setup-nat-network)
+* [Install and configure DHCP Server on Windows Server](https://learn.microsoft.com/en-us/windows-server/networking/technologies/dhcp/quickstart-install-configure-dhcp-server)
+* [DHCP Server IPv4 interface bindings](https://learn.microsoft.com/en-us/powershell/module/dhcpserver/set-dhcpserverv4binding)
+* [Prefer IPv4 over IPv6 in Windows](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/configure-ipv6-in-windows)
 * [Dsv5 series](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/dsv5-series)
 * [Managed disk types](https://learn.microsoft.com/en-us/azure/virtual-machines/disks-types)
 * [Install PowerShell on Windows, including unattended MSI options](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows)
